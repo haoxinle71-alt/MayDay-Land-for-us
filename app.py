@@ -352,6 +352,8 @@ def submit():
 
     return redirect(url_for("home"))
 
+import os
 if __name__ == "__main__":
-    # 用 5001，避免你机器上 5000 被占用
-    app.run(debug=True, port=5002)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+

@@ -1,10 +1,11 @@
 from flask import Flask, request, redirect, url_for, render_template_string, session
+import os
 import sqlite3
+import psycopg2
 from datetime import datetime, date
 
 app = Flask(__name__)
-app.secret_key = "mayday-secret-key-change-me"
-DB_PATH = "mayday_requests.db"
+app.secret_key = os.environ.get("SECRET_KEY", "mayday-secret-key-change-me")
 
 # 固定两个槽位：用户一 / 用户二
 SLOTS = ["user1", "user2"]
@@ -173,26 +174,84 @@ PAGE = """
 </html>
 """
 
+# -------------------------
+# Database: Postgres on Render (DATABASE_URL), SQLite locally
+# -------------------------
+BASE_DIR = os.path.dirname(__file__)
+SQLITE_PATH = os.path.join(BASE_DIR, "mayday_requests.db")
+
+def is_postgres() -> bool:
+    return bool(os.environ.get("DATABASE_URL"))
+
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-      CREATE TABLE IF NOT EXISTS submissions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        slot TEXT NOT NULL,
-        week_id TEXT NOT NULL,
-        song TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      )
-    """)
-    conn.execute("""
-      CREATE TABLE IF NOT EXISTS profiles (
-        slot TEXT PRIMARY KEY,
-        name TEXT NOT NULL
-      )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_slot_week ON submissions(slot, week_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_slot_song ON submissions(slot, song)")
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        # Render provides postgres://... which psycopg2 accepts
+        return psycopg2.connect(db_url)
+    conn = sqlite3.connect(SQLITE_PATH)
+    conn.row_factory = sqlite3.Row
     return conn
+
+def ph() -> str:
+    # placeholder token: %s for postgres, ? for sqlite
+    return "%s" if is_postgres() else "?"
+
+def execute(conn, sql: str, params=()):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    return cur
+
+def executemany(conn, sql: str, seq_params):
+    cur = conn.cursor()
+    cur.executemany(sql, seq_params)
+    return cur
+
+def init_db():
+    conn = get_conn()
+    try:
+        if is_postgres():
+            execute(conn, """
+              CREATE TABLE IF NOT EXISTS submissions (
+                id BIGSERIAL PRIMARY KEY,
+                slot TEXT NOT NULL,
+                week_id TEXT NOT NULL,
+                song TEXT NOT NULL,
+                created_at TEXT NOT NULL
+              )
+            """)
+            execute(conn, """
+              CREATE TABLE IF NOT EXISTS profiles (
+                slot TEXT PRIMARY KEY,
+                name TEXT NOT NULL
+              )
+            """)
+            execute(conn, "CREATE INDEX IF NOT EXISTS idx_slot_week ON submissions(slot, week_id)")
+            execute(conn, "CREATE INDEX IF NOT EXISTS idx_slot_song ON submissions(slot, song)")
+        else:
+            execute(conn, """
+              CREATE TABLE IF NOT EXISTS submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slot TEXT NOT NULL,
+                week_id TEXT NOT NULL,
+                song TEXT NOT NULL,
+                created_at TEXT NOT NULL
+              )
+            """)
+            execute(conn, """
+              CREATE TABLE IF NOT EXISTS profiles (
+                slot TEXT PRIMARY KEY,
+                name TEXT NOT NULL
+              )
+            """)
+            execute(conn, "CREATE INDEX IF NOT EXISTS idx_slot_week ON submissions(slot, week_id)")
+            execute(conn, "CREATE INDEX IF NOT EXISTS idx_slot_song ON submissions(slot, song)")
+
+        conn.commit()
+    finally:
+        conn.close()
+
+# ✅ 启动时确保表存在（Render / 本地都能用）
+init_db()
 
 def current_week_id() -> str:
     y, w, _ = date.today().isocalendar()
@@ -202,7 +261,6 @@ def normalize_song(s: str) -> str:
     return " ".join((s or "").strip().split())
 
 def normalize_name(s: str) -> str:
-    # 昵称允许任何字符；这里做最轻量的清理（去掉首尾空格）
     return (s or "").strip()
 
 def label_for(slot: str) -> str:
@@ -210,61 +268,84 @@ def label_for(slot: str) -> str:
 
 def get_names() -> dict:
     conn = get_conn()
-    cur = conn.execute("SELECT slot, name FROM profiles")
-    d = {slot: name for slot, name in cur.fetchall()}
-    conn.close()
-    # 没设置过昵称时给默认显示
+    try:
+        cur = execute(conn, "SELECT slot, name FROM profiles")
+        rows = cur.fetchall()
+        d = {slot: name for slot, name in rows}
+    finally:
+        conn.close()
+
     for s in SLOTS:
         d.setdefault(s, label_for(s))
     return d
 
 def set_name(slot: str, name: str):
     conn = get_conn()
-    conn.execute("""
-      INSERT INTO profiles(slot, name) VALUES(?, ?)
-      ON CONFLICT(slot) DO UPDATE SET name=excluded.name
-    """, (slot, name))
-    conn.commit()
-    conn.close()
+    try:
+        if is_postgres():
+            execute(conn, """
+              INSERT INTO profiles(slot, name) VALUES(%s, %s)
+              ON CONFLICT(slot) DO UPDATE SET name = EXCLUDED.name
+            """, (slot, name))
+        else:
+            execute(conn, """
+              INSERT INTO profiles(slot, name) VALUES(?, ?)
+              ON CONFLICT(slot) DO UPDATE SET name = excluded.name
+            """, (slot, name))
+        conn.commit()
+    finally:
+        conn.close()
 
 def top3_for(slot: str):
     conn = get_conn()
-    cur = conn.execute("""
-      SELECT song, COUNT(*) as cnt
-      FROM submissions
-      WHERE slot = ?
-      GROUP BY song
-      ORDER BY cnt DESC, song ASC
-      LIMIT 3
-    """, (slot,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    try:
+        token = ph()
+        sql = f"""
+          SELECT song, COUNT(*) as cnt
+          FROM submissions
+          WHERE slot = {token}
+          GROUP BY song
+          ORDER BY cnt DESC, song ASC
+          LIMIT 3
+        """
+        cur = execute(conn, sql, (slot,))
+        rows = cur.fetchall()
+        return rows
+    finally:
+        conn.close()
 
 def this_week_rows(week_id: str):
     conn = get_conn()
-    cur = conn.execute("""
-      SELECT slot, song, created_at
-      FROM submissions
-      WHERE week_id = ?
-      ORDER BY created_at DESC
-      LIMIT 200
-    """, (week_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    try:
+        token = ph()
+        sql = f"""
+          SELECT slot, song, created_at
+          FROM submissions
+          WHERE week_id = {token}
+          ORDER BY created_at DESC
+          LIMIT 200
+        """
+        cur = execute(conn, sql, (week_id,))
+        rows = cur.fetchall()
+        return rows
+    finally:
+        conn.close()
 
 def week_songs_for(slot: str, week_id: str):
     conn = get_conn()
-    cur = conn.execute("""
-      SELECT song
-      FROM submissions
-      WHERE slot = ? AND week_id = ?
-      ORDER BY id ASC
-    """, (slot, week_id))
-    songs = [r[0] for r in cur.fetchall()]
-    conn.close()
-    return songs
+    try:
+        token = ph()
+        sql = f"""
+          SELECT song
+          FROM submissions
+          WHERE slot = {token} AND week_id = {token}
+          ORDER BY id ASC
+        """
+        cur = execute(conn, sql, (slot, week_id))
+        songs = [r[0] for r in cur.fetchall()]
+        return songs
+    finally:
+        conn.close()
 
 @app.get("/login")
 def login_get():
@@ -282,9 +363,7 @@ def login_post():
     if len(name) > 64:
         return render_template_string(LOGIN_PAGE, error="昵称太长啦（最多 64 个字符）。")
 
-    # 记住“我是哪一位”
     session["slot"] = slot
-    # 把昵称持久化，双方都能看到
     set_name(slot, name)
 
     return redirect(url_for("home"))
@@ -341,19 +420,33 @@ def submit():
     now = datetime.now().isoformat(timespec="seconds")
 
     conn = get_conn()
-    # 本周覆盖：先删旧的再写新的三首
-    conn.execute("DELETE FROM submissions WHERE slot = ? AND week_id = ?", (slot, week_id))
-    conn.executemany(
-        "INSERT INTO submissions(slot, week_id, song, created_at) VALUES(?,?,?,?)",
-        [(slot, week_id, s, now) for s in songs]
-    )
-    conn.commit()
-    conn.close()
+    try:
+        token = ph()
+        # 本周覆盖：先删旧的再写新的三首
+        execute(conn, f"DELETE FROM submissions WHERE slot = {token} AND week_id = {token}", (slot, week_id))
+
+        if is_postgres():
+            executemany(
+                conn,
+                "INSERT INTO submissions(slot, week_id, song, created_at) VALUES(%s,%s,%s,%s)",
+                [(slot, week_id, s, now) for s in songs]
+            )
+        else:
+            executemany(
+                conn,
+                "INSERT INTO submissions(slot, week_id, song, created_at) VALUES(?,?,?,?)",
+                [(slot, week_id, s, now) for s in songs]
+            )
+
+        conn.commit()
+    finally:
+        conn.close()
 
     return redirect(url_for("home"))
 
 import os
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
